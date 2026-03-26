@@ -13,6 +13,7 @@ dependencies:
   record: ^6.2.0
   http: ^1.6.0
   audioplayers: ^6.1.0
+  flutter_tts: ^4.0.0
 
 dev_dependencies:
   flutter_test:

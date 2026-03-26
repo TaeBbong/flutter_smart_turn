@@ -1,143 +1,99 @@
 import 'dart:async';
-import 'dart:convert';
 
-import 'package:audioplayers/audioplayers.dart';
-import 'package:http/http.dart' as http;
+import 'package:flutter_tts/flutter_tts.dart';
 
-/// Placeholder TTS (Text-to-Speech) service.
+/// TTS (Text-to-Speech) service using platform-native engine.
 ///
-/// In production, replace with a real TTS integration such as:
-/// - Google Cloud TTS
-/// - ElevenLabs
-/// - Platform native TTS (flutter_tts)
+/// Uses [FlutterTts] which starts speaking immediately (streaming synthesis)
+/// and coexists cleanly with the audio recording session.
 class TtsService {
-  final AudioPlayer _player = AudioPlayer();
-
-  /// API key for TTS service (optional — falls back to stub).
-  final String? apiKey;
+  final FlutterTts _flutterTts = FlutterTts();
+  final String language;
 
   /// The full text currently being spoken.
   String? _currentText;
 
-  /// When playback started for the current utterance.
-  DateTime? _playbackStartTime;
+  /// Character offset tracking from flutter_tts progress handler.
+  int _lastSpokenOffset = 0;
 
-  /// Estimated total duration for the current utterance.
-  Duration? _estimatedDuration;
-
-  /// Completer for the current speak operation (used for cancellation).
+  /// Completer for the current speak operation.
   Completer<void>? _speakCompleter;
 
-  TtsService({this.apiKey});
+  TtsService({this.language = 'en-US'});
 
-  /// Speak the given text.
-  ///
-  /// This is a stub that simulates playback delay.
-  /// Replace with actual TTS API call + audio playback.
-  Future<void> speak(String text) async {
-    _currentText = text;
-    _playbackStartTime = DateTime.now();
+  /// Initialize the TTS engine. Must be called before [speak].
+  Future<void> initialize() async {
+    await _flutterTts.setLanguage(language);
+    await _flutterTts.setSpeechRate(0.5);
+    await _flutterTts.setVolume(1.0);
+    await _flutterTts.setPitch(1.0);
 
-    if (apiKey != null && apiKey!.isNotEmpty) {
-      await _speakWithApi(text);
-    } else {
-      // Stub: simulate TTS playback duration based on text length.
-      // ~150ms per word is a rough approximation.
-      final wordCount = text.split(' ').length;
-      final duration = Duration(milliseconds: wordCount * 150);
-      _estimatedDuration = duration;
-
-      _speakCompleter = Completer<void>();
-      final timer = Timer(duration, () {
-        if (!_speakCompleter!.isCompleted) {
-          _speakCompleter!.complete();
-        }
-      });
-
-      try {
-        await _speakCompleter!.future;
-      } finally {
-        timer.cancel();
-      }
-    }
-
-    _currentText = null;
-    _playbackStartTime = null;
-    _estimatedDuration = null;
-    _speakCompleter = null;
-  }
-
-  Future<void> _speakWithApi(String text) async {
-    // Example: Google Cloud TTS.
-    // Replace with your preferred TTS provider.
-    final wordCount = text.split(' ').length;
-    _estimatedDuration = Duration(milliseconds: wordCount * 150);
-
-    final url =
-        'https://texttospeech.googleapis.com/v1/text:synthesize?key=$apiKey';
-    final response = await http.post(
-      Uri.parse(url),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({
-        'input': {'text': text},
-        'voice': {
-          'languageCode': 'en-US',
-          'name': 'en-US-Neural2-F',
-        },
-        'audioConfig': {'audioEncoding': 'MP3'},
-      }),
+    // Keep audio session alive so recording isn't interrupted.
+    await _flutterTts.setIosAudioCategory(
+      IosTextToSpeechAudioCategory.playAndRecord,
+      [IosTextToSpeechAudioCategoryOptions.defaultToSpeaker],
     );
 
-    if (response.statusCode != 200) {
-      throw Exception('TTS API request failed: HTTP ${response.statusCode}');
-    }
+    _flutterTts.setCompletionHandler(() {
+      if (_speakCompleter != null && !_speakCompleter!.isCompleted) {
+        _speakCompleter!.complete();
+      }
+    });
 
-    final data = jsonDecode(response.body) as Map<String, dynamic>;
-    final audioContent = data['audioContent'] as String?;
-    if (audioContent != null) {
-      final bytes = base64Decode(audioContent);
-      await _player.play(BytesSource(bytes));
-      await _player.onPlayerComplete.first;
-    }
+    _flutterTts.setCancelHandler(() {
+      if (_speakCompleter != null && !_speakCompleter!.isCompleted) {
+        _speakCompleter!.complete();
+      }
+    });
+
+    _flutterTts.setErrorHandler((msg) {
+      if (_speakCompleter != null && !_speakCompleter!.isCompleted) {
+        _speakCompleter!.completeError(Exception('TTS error: $msg'));
+      }
+    });
+
+    // Track word-level progress for accurate interruption handling.
+    _flutterTts.setProgressHandler(
+      (String text, int start, int end, String word) {
+        _lastSpokenOffset = end;
+      },
+    );
   }
 
-  /// Stop current playback immediately and return what was spoken so far.
+  /// Speak the given text. Starts playing immediately (streaming synthesis).
+  Future<void> speak(String text) async {
+    _currentText = text;
+    _lastSpokenOffset = 0;
+    _speakCompleter = Completer<void>();
+    await _flutterTts.speak(text);
+    await _speakCompleter!.future;
+    _reset();
+  }
+
+  /// Stop current playback and return what was spoken so far.
   ///
-  /// Returns a [TtsProgress] indicating how much of the text was delivered
-  /// before the interruption. This is essential for building accurate
-  /// conversation context after a barge-in.
-  ///
-  /// The progress estimation uses elapsed time vs estimated total duration.
-  /// In production, use your TTS provider's progress callback for accuracy.
+  /// Uses flutter_tts word-level progress for accurate tracking.
   Future<TtsProgress> stopAndGetProgress() async {
     final text = _currentText ?? '';
-    final startTime = _playbackStartTime;
-    final estimatedTotal = _estimatedDuration;
 
-    // Cancel the stub timer if active.
+    await _flutterTts.stop();
+
     if (_speakCompleter != null && !_speakCompleter!.isCompleted) {
       _speakCompleter!.complete();
     }
-    await _player.stop();
 
-    if (text.isEmpty || startTime == null || estimatedTotal == null) {
-      return TtsProgress(fullText: text, spokenText: '', remainingText: text);
+    String spokenText;
+    String remainingText;
+
+    if (_lastSpokenOffset > 0 && _lastSpokenOffset <= text.length) {
+      spokenText = text.substring(0, _lastSpokenOffset);
+      remainingText = text.substring(_lastSpokenOffset);
+    } else {
+      spokenText = '';
+      remainingText = text;
     }
 
-    // Estimate how much was spoken based on elapsed time.
-    final elapsed = DateTime.now().difference(startTime);
-    final progress =
-        (elapsed.inMilliseconds / estimatedTotal.inMilliseconds).clamp(0.0, 1.0);
-
-    final words = text.split(' ');
-    final spokenWordCount = (words.length * progress).round();
-    final spokenText = words.take(spokenWordCount).join(' ');
-    final remainingText = words.skip(spokenWordCount).join(' ');
-
-    _currentText = null;
-    _playbackStartTime = null;
-    _estimatedDuration = null;
-    _speakCompleter = null;
+    _reset();
 
     return TtsProgress(
       fullText: text,
@@ -148,30 +104,28 @@ class TtsService {
 
   /// Stop current playback immediately (for simple barge-in without tracking).
   Future<void> stop() async {
+    await _flutterTts.stop();
     if (_speakCompleter != null && !_speakCompleter!.isCompleted) {
       _speakCompleter!.complete();
     }
-    await _player.stop();
+    _reset();
+  }
+
+  void _reset() {
     _currentText = null;
-    _playbackStartTime = null;
-    _estimatedDuration = null;
+    _lastSpokenOffset = 0;
     _speakCompleter = null;
   }
 
   void dispose() {
-    _player.dispose();
+    _flutterTts.stop();
   }
 }
 
 /// Represents how much of an utterance was spoken before interruption.
 class TtsProgress {
-  /// The complete text that was being spoken.
   final String fullText;
-
-  /// The portion that was likely already delivered to the user.
   final String spokenText;
-
-  /// The portion that was not yet spoken.
   final String remainingText;
 
   const TtsProgress({

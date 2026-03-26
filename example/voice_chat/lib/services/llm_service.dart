@@ -68,16 +68,19 @@ class LlmService {
 
     try {
       final url =
-          '$baseUrl/models/gemini-2.0-flash:generateContent?key=$apiKey';
+          '$baseUrl/models/gemini-2.5-flash:generateContent?key=$apiKey';
 
       // Build contents array with conversation history.
       final contents = <Map<String, dynamic>>[];
       if (context != null) {
         for (final turn in context) {
+          final text = turn.wasInterrupted
+              ? '${turn.text} [interrupted — did not finish speaking]'
+              : turn.text;
           contents.add({
             'role': turn.isUser ? 'user' : 'model',
             'parts': [
-              {'text': turn.text}
+              {'text': text}
             ],
           });
         }
@@ -92,7 +95,22 @@ class LlmService {
       final response = await _activeClient!.post(
         Uri.parse(url),
         headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'contents': contents}),
+        body: jsonEncode({
+          'system_instruction': {
+            'parts': [
+              {
+                'text':
+                    'You are a friendly voice assistant in a real-time conversation. '
+                    'Keep responses concise (1-3 sentences) and natural for spoken dialogue. '
+                    'Do not use markdown, bullet points, or special formatting — '
+                    'your text will be read aloud by a TTS engine. '
+                    'If the conversation shows you were interrupted, '
+                    'briefly acknowledge it and address the user\'s latest message.',
+              }
+            ],
+          },
+          'contents': contents,
+        }),
       );
 
       if (_cancelled) throw GenerationCancelledException();
@@ -125,17 +143,36 @@ class LlmService {
 
     // If this is a post-interruption re-generation, acknowledge it.
     if (context != null && context.any((t) => t.wasInterrupted)) {
-      return "No problem! Let me address that instead. "
+      return "Sorry about that! Let me address your question instead. "
           "You asked: '$userMessage'. That's a great question!";
     }
 
-    if (lower.contains('hello') || lower.contains('hi')) {
-      return 'Hello! How can I help you today?';
+    if (lower.contains('hello') || lower.contains('hi') ||
+        lower.contains('how are you')) {
+      return "Hello! I'm doing great, thanks for asking! "
+          "How can I help you today?";
     }
-    if (lower.contains('how are you')) {
-      return "I'm doing great, thanks for asking! How about you?";
+    if (lower.contains('joke')) {
+      return 'Why do programmers prefer dark mode? '
+          'Because light attracts bugs!';
     }
-    return "That's interesting! Tell me more about it.";
+    if (lower.contains('interesting') || lower.contains('tell me')) {
+      return 'Did you know that honey never spoils? Archaeologists have found '
+          '3000-year-old honey in Egyptian tombs that was still edible!';
+    }
+    if (lower.contains('help')) {
+      return "I can chat about anything! Try asking me a question, "
+          "requesting a joke, or just having a conversation.";
+    }
+    if (lower.contains('explain') || lower.contains('simpler')) {
+      return "Of course! In simpler terms, I'm a voice assistant that uses "
+          "smart turn-taking to have natural conversations with you.";
+    }
+    if (lower.contains('thank')) {
+      return "You're welcome! Is there anything else you'd like to chat about?";
+    }
+    return "That's a great point! I'd love to hear more about "
+        "your thoughts on that.";
   }
 }
 

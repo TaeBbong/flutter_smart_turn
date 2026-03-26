@@ -5,8 +5,27 @@ import 'package:flutter/material.dart';
 import 'package:flutter_smart_turn/flutter_smart_turn.dart';
 import 'package:record/record.dart';
 
+import 'services/asr_service.dart';
 import 'services/llm_service.dart';
 import 'services/tts_service.dart';
+
+// ---------------------------------------------------------------------------
+// API key configuration.
+//
+// Set via:
+//   flutter run --dart-define=GEMINI_API_KEY=xxx
+//
+// A single Gemini API key powers all three services:
+//   - ASR: Gemini 2.0 Flash (audio input → transcription)
+//   - LLM: Gemini 2.0 Flash (text generation)
+//   - TTS: Gemini 2.5 Flash TTS (text → audio generation)
+//
+// Without a key, the app runs in demo mode:
+//   - ASR: cycles through predefined sample phrases
+//   - LLM: returns stub conversational responses
+//   - TTS: uses platform-native text-to-speech (always works)
+// ---------------------------------------------------------------------------
+const _geminiApiKey = String.fromEnvironment('GEMINI_API_KEY');
 
 void main() {
   runApp(const VoiceChatApp());
@@ -36,17 +55,26 @@ class ChatPage extends StatefulWidget {
 }
 
 class _ChatPageState extends State<ChatPage> {
-  late final TurnController _turnController;
+  late TurnController _turnController;
   final AudioRecorder _recorder = AudioRecorder();
+  late final AsrService _asr;
   late final LlmService _llm;
   late final TtsService _tts;
 
   bool _isRecording = false;
+  bool _isInitializing = true;
+  String? _engineLabel;
   ConversationState _currentState = ConversationState.idle;
   final List<ChatMessage> _messages = [];
 
   /// Conversation history for LLM context (survives interruptions).
   final List<ConversationTurn> _conversationHistory = [];
+
+  /// Raw PCM16 audio buffer for ASR transcription.
+  final List<Uint8List> _audioBuffer = [];
+
+  /// Smoothed audio energy for VAD (exponential moving average).
+  double _smoothedEnergy = 0.0;
 
   /// Whether the agent is currently in a generate → speak pipeline.
   /// Used to prevent overlapping pipelines.
@@ -59,20 +87,39 @@ class _ChatPageState extends State<ChatPage> {
   @override
   void initState() {
     super.initState();
-    _llm = LlmService();
+    _asr = AsrService(
+      apiKey: _geminiApiKey.isNotEmpty ? _geminiApiKey : null,
+    );
+    _llm = LlmService(
+      apiKey: _geminiApiKey.isNotEmpty ? _geminiApiKey : null,
+    );
     _tts = TtsService();
-    _turnController = TurnController.withHeuristic();
     _setup();
   }
 
   Future<void> _setup() async {
-    await _turnController.initialize();
+    await _tts.initialize();
+
+    // Try SmartTurn (ONNX model) first, fall back to heuristic on failure.
+    try {
+      _turnController = TurnController.withSmartTurn();
+      await _turnController.initialize();
+      _engineLabel = 'SmartTurn';
+    } catch (e) {
+      debugPrint('SmartTurn init failed ($e), falling back to heuristic');
+      _turnController = TurnController.withHeuristic();
+      await _turnController.initialize();
+      _engineLabel = 'Heuristic';
+    }
 
     _decisionSub = _turnController.decisions.listen(_handleDecision);
     _stateSub = _turnController.stateChanges.listen((state) {
       if (!mounted) return;
+      debugPrint('[State] ${state.name}');
       setState(() => _currentState = state);
     });
+
+    if (mounted) setState(() => _isInitializing = false);
   }
 
   // ---------------------------------------------------------------------------
@@ -80,6 +127,13 @@ class _ChatPageState extends State<ChatPage> {
   // ---------------------------------------------------------------------------
 
   Future<void> _handleDecision(TurnDecision decision) async {
+    // Log non-trivial decisions (skip continueListening to reduce noise).
+    if (decision.action != TurnAction.continueListening) {
+      debugPrint('[Decision] ${decision.action.name} '
+          '(confidence: ${decision.confidence.toStringAsFixed(2)}, '
+          'reason: ${decision.reason})');
+    }
+
     switch (decision.action) {
       case TurnAction.commitAndRespond:
         await _handleCommit();
@@ -94,21 +148,39 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   // ---------------------------------------------------------------------------
-  // Commit — user finished speaking, generate and speak response.
+  // Commit — user finished speaking, transcribe → generate → speak.
   // ---------------------------------------------------------------------------
 
   Future<void> _handleCommit() async {
-    // TODO: Wire up ASR to populate real user text.
-    const userText = '...';
+    if (_agentResponding) return;
 
-    // Add user message to UI and conversation history.
+    // 1. Merge buffered audio and clear for next utterance.
+    final audioBytes = AsrService.mergeBuffers(_audioBuffer);
+    _audioBuffer.clear();
+
+    // 2. Transcribe audio to text.
+    String userText;
+    try {
+      userText = await _asr.transcribe(audioBytes);
+    } catch (e) {
+      debugPrint('ASR failed: $e');
+      userText = '';
+    }
+
+    if (userText.trim().isEmpty) return;
+
+    // 3. Add user message to UI and conversation history.
     setState(() {
-      _messages.add(const ChatMessage(text: userText, isUser: true));
+      _messages.add(ChatMessage(text: userText, isUser: true));
     });
     _conversationHistory.add(
-      const ConversationTurn(text: userText, isUser: true),
+      ConversationTurn(text: userText, isUser: true),
     );
 
+    // Feed transcript to controller for context.
+    _turnController.onFinalTranscript(userText);
+
+    // 4. Generate and speak response.
     await _generateAndSpeak(userText);
   }
 
@@ -145,8 +217,14 @@ class _ChatPageState extends State<ChatPage> {
       );
 
       // --- Phase 2: TTS playback ---
+      // Clear audio buffer before speaking to discard any echo/noise
+      // accumulated during LLM generation.
+      _audioBuffer.clear();
       _turnController.onAgentStateChanged(AgentState.speaking);
       await _tts.speak(response);
+      // Clear again after speaking to discard TTS echo residue.
+      _audioBuffer.clear();
+      _smoothedEnergy = 0.0;
       _turnController.onAgentStateChanged(AgentState.idle);
     } finally {
       _agentResponding = false;
@@ -230,6 +308,8 @@ class _ChatPageState extends State<ChatPage> {
   Future<void> _startRecording() async {
     if (!await _recorder.hasPermission()) return;
 
+    _audioBuffer.clear();
+
     final stream = await _recorder.startStream(
       const RecordConfig(
         encoder: AudioEncoder.pcm16bits,
@@ -243,11 +323,39 @@ class _ChatPageState extends State<ChatPage> {
 
     _audioStreamSub = stream.listen((bytes) {
       if (bytes.isEmpty) return;
+      // Buffer raw PCM16 bytes for ASR transcription.
+      _audioBuffer.add(Uint8List.fromList(bytes));
+      // Convert to Float32 for turn controller analysis.
       final samples = AudioUtils.pcm16BytesToFloat32(bytes);
-      _turnController.onAudioFrame(AudioFrame(
-        samples: samples,
-        timestamp: DateTime.now(),
-      ));
+
+      // Energy-based VAD with smoothing — prevents rapid toggling
+      // during micro-pauses between syllables.
+      double energy = 0.0;
+      for (int i = 0; i < samples.length; i++) {
+        energy += samples[i] * samples[i];
+      }
+      energy /= samples.length;
+      // Asymmetric EMA: fast attack (detect speech quickly),
+      // slow decay (ride through micro-pauses).
+      final alpha = energy > _smoothedEnergy ? 0.4 : 0.05;
+      _smoothedEnergy = alpha * energy + (1.0 - alpha) * _smoothedEnergy;
+
+      // Suppress VAD while agent is speaking — TTS echo through the mic
+      // would otherwise trigger false barge-in.
+      final agentActive =
+          _currentState == ConversationState.agentSpeaking ||
+          _currentState == ConversationState.agentThinking;
+      _turnController.onVadResult(!agentActive && _smoothedEnergy > 0.002);
+
+      // Feed audio to turn controller for engine analysis.
+      _turnController
+          .onAudioFrame(AudioFrame(
+            samples: samples,
+            timestamp: DateTime.now(),
+          ))
+          .catchError(
+            (Object e) => debugPrint('[AudioFrame error] $e'),
+          );
     });
 
     setState(() => _isRecording = true);
@@ -258,6 +366,7 @@ class _ChatPageState extends State<ChatPage> {
     _audioStreamSub = null;
     await _recorder.stop();
     _turnController.reset();
+    _audioBuffer.clear();
     setState(() {
       _isRecording = false;
       _currentState = ConversationState.idle;
@@ -281,10 +390,38 @@ class _ChatPageState extends State<ChatPage> {
 
   @override
   Widget build(BuildContext context) {
+    if (_isInitializing) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Voice Chat')),
+        body: const Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(height: 16),
+              Text('Initializing turn engine...'),
+            ],
+          ),
+        ),
+      );
+    }
+
+    final isDemoMode = _geminiApiKey.isEmpty;
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Voice Chat'),
         actions: [
+          if (_engineLabel != null)
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: Chip(
+                label: Text(
+                  _engineLabel!,
+                  style: const TextStyle(fontSize: 10),
+                ),
+              ),
+            ),
           Padding(
             padding: const EdgeInsets.only(right: 16),
             child: Chip(
@@ -299,6 +436,17 @@ class _ChatPageState extends State<ChatPage> {
       ),
       body: Column(
         children: [
+          if (isDemoMode)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              color: Colors.amber.withAlpha(40),
+              child: const Text(
+                'Demo mode — ASR uses sample phrases, LLM uses stub responses.\n'
+                'Set GEMINI_API_KEY via --dart-define for real APIs.',
+                style: TextStyle(fontSize: 11, color: Colors.orange),
+              ),
+            ),
           Expanded(
             child: _messages.isEmpty
                 ? const Center(

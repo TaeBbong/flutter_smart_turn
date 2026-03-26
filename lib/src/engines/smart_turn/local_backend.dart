@@ -4,18 +4,22 @@ import 'package:flutter_onnxruntime/flutter_onnxruntime.dart';
 
 import 'model_manager.dart';
 import 'smart_turn_backend.dart';
+import 'whisper_features.dart';
 
 /// Local ONNX Runtime backend for Smart Turn inference.
 ///
 /// Downloads and caches the Smart Turn v3 model, then runs inference
 /// on-device using [flutter_onnxruntime].
 ///
-/// Expects callers to provide audio already padded to [expectedInputLength].
+/// The model expects Whisper-style log-mel spectrogram features with
+/// shape [1, 80, 800]. This backend handles the feature extraction
+/// from raw audio samples.
 class LocalSmartTurnBackend implements SmartTurnBackend {
   final ModelManager _modelManager;
   final OnnxRuntime _runtime = OnnxRuntime();
 
   OrtSession? _session;
+  late final WhisperFeatureExtractor _featureExtractor;
 
   /// The expected input length: 8 seconds at 16kHz = 128000 samples.
   static const int expectedInputLength = 128000;
@@ -27,6 +31,7 @@ class LocalSmartTurnBackend implements SmartTurnBackend {
   Future<void> connect() async {
     final modelPath = await _modelManager.ensureModel();
     _session = await _runtime.createSession(modelPath);
+    _featureExtractor = WhisperFeatureExtractor();
   }
 
   @override
@@ -38,10 +43,16 @@ class LocalSmartTurnBackend implements SmartTurnBackend {
       );
     }
 
+    // Extract Whisper mel spectrogram features [80, 800].
+    final features = _featureExtractor.extract(audioSamples);
+
+    // Create 3D input tensor [batch=1, mels=80, frames=800].
     final inputName =
         session.inputNames.isNotEmpty ? session.inputNames.first : 'input';
-    final inputTensor =
-        await OrtValue.fromList(audioSamples, [audioSamples.length]);
+    final inputTensor = await OrtValue.fromList(
+      features,
+      [1, WhisperFeatureExtractor.nMels, WhisperFeatureExtractor.nFrames],
+    );
 
     final outputs = await session.run({inputName: inputTensor});
 

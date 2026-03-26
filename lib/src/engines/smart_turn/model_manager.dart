@@ -16,8 +16,8 @@ class ModelConfig {
 
   const ModelConfig({
     this.modelUrl =
-        'https://huggingface.co/pipecat-ai/smart-turn-v3/resolve/main/smart_turn_v3.int8.onnx',
-    this.modelFilename = 'smart_turn_v3.int8.onnx',
+        'https://huggingface.co/pipecat-ai/smart-turn-v3/resolve/main/smart-turn-v3.2-cpu.onnx',
+    this.modelFilename = 'smart-turn-v3.2-cpu.onnx',
     this.expectedSizeBytes,
   });
 }
