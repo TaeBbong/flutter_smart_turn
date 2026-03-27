@@ -191,6 +191,59 @@ void main() {
     });
   });
 
+  group('allowBargeIn', () {
+    test('VAD is suppressed during agent speech when allowBargeIn is false',
+        () async {
+      controller.allowBargeIn = false;
+      final states = <ConversationState>[];
+      controller.stateChanges.listen(states.add);
+
+      // Agent starts speaking.
+      controller.onAgentStateChanged(AgentState.thinking);
+      controller.onAgentStateChanged(AgentState.speaking);
+
+      // VAD fires during agent speech — should be ignored.
+      controller.onVadResult(true);
+      await Future.delayed(Duration.zero);
+
+      expect(states, isNot(contains(ConversationState.interrupted)));
+    });
+
+    test('VAD works during agent speech when allowBargeIn is true', () async {
+      controller.allowBargeIn = true;
+      final states = <ConversationState>[];
+      controller.stateChanges.listen(states.add);
+
+      controller.onAgentStateChanged(AgentState.thinking);
+      controller.onAgentStateChanged(AgentState.speaking);
+
+      controller.onVadResult(true);
+      await Future.delayed(Duration.zero);
+
+      expect(states, contains(ConversationState.interrupted));
+    });
+
+    test('allowBargeIn can be toggled at runtime', () async {
+      final states = <ConversationState>[];
+      controller.stateChanges.listen(states.add);
+
+      // Start with barge-in disabled.
+      controller.allowBargeIn = false;
+      controller.onAgentStateChanged(AgentState.thinking);
+      controller.onAgentStateChanged(AgentState.speaking);
+
+      controller.onVadResult(true);
+      await Future.delayed(Duration.zero);
+      expect(states, isNot(contains(ConversationState.interrupted)));
+
+      // Enable barge-in at runtime.
+      controller.allowBargeIn = true;
+      controller.onVadResult(true);
+      await Future.delayed(Duration.zero);
+      expect(states, contains(ConversationState.interrupted));
+    });
+  });
+
   group('factory constructors', () {
     test('withHeuristic creates working controller', () async {
       final hc = TurnController.withHeuristic();

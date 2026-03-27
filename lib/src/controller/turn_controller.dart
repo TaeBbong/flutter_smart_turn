@@ -55,6 +55,15 @@ class TurnController {
   bool _initialized = false;
   bool _analyzing = false;
 
+  /// Whether user barge-in is allowed during agent speech.
+  ///
+  /// When `false`, [onVadResult] suppresses speech detection while the agent
+  /// is speaking, preventing TTS echo from triggering false interrupts.
+  /// Can be toggled at runtime (e.g. switching between speaker and earphone).
+  ///
+  /// Defaults to `true`.
+  bool allowBargeIn = true;
+
   /// Create a controller with explicit components.
   TurnController({
     required TurnEngine engine,
@@ -155,6 +164,12 @@ class TurnController {
 
   /// Report VAD (Voice Activity Detection) result.
   void onVadResult(bool isSpeaking) {
+    // Suppress speech detection during agent playback when barge-in is
+    // disabled, preventing TTS echo from triggering false interrupts.
+    if (!allowBargeIn && _agentIsSpeaking) {
+      return;
+    }
+
     if (isSpeaking && !_userIsSpeaking) {
       _userIsSpeaking = true;
       _speechStartTime = DateTime.now();

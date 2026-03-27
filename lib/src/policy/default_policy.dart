@@ -12,13 +12,24 @@ class PolicyConfig extends Equatable {
   /// Minimum interval (ms) between consecutive commits (debounce).
   final int commitDebounceMs;
 
+  /// Whether user barge-in (interrupt) is allowed during agent speech.
+  ///
+  /// When `false`, all interrupt actions are suppressed while the agent is
+  /// speaking. This is useful for speaker-out scenarios where TTS audio
+  /// leaks into the microphone and triggers false barge-in detections.
+  ///
+  /// Defaults to `true` (barge-in allowed).
+  final bool allowBargeIn;
+
   const PolicyConfig({
     this.minSpeechBeforeCommitMs = 300,
     this.commitDebounceMs = 500,
+    this.allowBargeIn = true,
   });
 
   @override
-  List<Object?> get props => [minSpeechBeforeCommitMs, commitDebounceMs];
+  List<Object?> get props =>
+      [minSpeechBeforeCommitMs, commitDebounceMs, allowBargeIn];
 }
 
 /// Default conversation policy with safety rules.
@@ -94,6 +105,14 @@ class DefaultPolicy implements TurnPolicy {
       return decision.copyWith(
         action: TurnAction.continueListening,
         reason: 'Policy: interrupt ignored — agent not speaking',
+      );
+    }
+
+    // Guard: Block barge-in when disabled (e.g. speaker-out mode).
+    if (!config.allowBargeIn) {
+      return decision.copyWith(
+        action: TurnAction.continueTalking,
+        reason: 'Policy: barge-in disabled',
       );
     }
 

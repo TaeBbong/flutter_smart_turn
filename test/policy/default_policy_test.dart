@@ -143,4 +143,31 @@ void main() {
       expect(result.action, TurnAction.hold);
     });
   });
+
+  group('allowBargeIn', () {
+    test('blocks interrupt when allowBargeIn is false', () {
+      final noBargeInPolicy = DefaultPolicy(
+        config: const PolicyConfig(allowBargeIn: false),
+      );
+      const decision = TurnDecision(
+        action: TurnAction.interruptAgent,
+        confidence: 0.9,
+      );
+      final result = noBargeInPolicy.apply(
+        decision,
+        makeCtx(agentIsSpeaking: true),
+      );
+      expect(result.action, TurnAction.continueTalking);
+      expect(result.reason, contains('barge-in disabled'));
+    });
+
+    test('allows interrupt when allowBargeIn is true (default)', () {
+      const decision = TurnDecision(
+        action: TurnAction.interruptAgent,
+        confidence: 0.9,
+      );
+      final result = policy.apply(decision, makeCtx(agentIsSpeaking: true));
+      expect(result.action, TurnAction.interruptAgent);
+    });
+  });
 }
